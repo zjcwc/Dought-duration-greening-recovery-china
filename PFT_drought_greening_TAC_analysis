@@ -1,0 +1,608 @@
+# PFT-specific drought-duration sensitivity under different greening rates
+# Public GitHub version
+#
+# Purpose
+# -------
+# This script summarizes the workflow used to test whether drought-history
+# effects on vegetation local-recovery signals differ among broad plant
+# functional types (PFTs) and greening-rate classes.
+#
+# The script is intentionally written as a public-facing workflow:
+#   - local project paths are replaced by placeholder paths;
+#   - fine publication-figure tuning is omitted;
+#   - the core statistical logic is retained.
+#
+# Expected input
+# --------------
+# 1. A model table produced by the drought-trait GAM workflow, containing:
+#      x, y, TAC_z,
+#      AMT_z, GSVPD_z, PS_z, IVP_z,
+#      kNDVI_mean_z,
+#      Total_Drought_Count_z, SUB_Severity_z, SUB_Duration_z,
+#      clim4_name, greening_rate_class
+#
+# 2. Either:
+#      a) a PFT column already present in the model table, named PFT_name; or
+#      b) a PFT raster and coordinates x/y for extracting PFT labels.
+#
+# Model concept
+# -------------
+# For each PFT separately:
+#
+#   TAC_z ~ greening_rate_class
+#         + climate controls
+#         + spatial smooth
+#         + mean greenness
+#         + drought traits by greening-rate class
+#
+# The main output is the high-minus-low drought-trait effect within each
+# greening-rate class, and the difference between high-positive and
+# low/negative greening classes.
+
+# ============================================================
+# 0. Packages
+# ============================================================
+
+required_pkgs <- c(
+  "data.table", "dplyr", "ggplot2", "mgcv", "terra"
+)
+
+to_install <- setdiff(required_pkgs, rownames(installed.packages()))
+if (length(to_install) > 0) {
+  install.packages(to_install, repos = "https://cloud.r-project.org")
+}
+
+suppressPackageStartupMessages({
+  invisible(lapply(required_pkgs, library, character.only = TRUE))
+})
+
+# ============================================================
+# 1. User settings
+# ============================================================
+
+# Replace these paths with your local or project-specific files.
+MODEL_TABLE_PATH <- "outputs/drought_traits_TAC_state_dependence/model_table_scaled.csv"
+
+# Optional: used only if MODEL_TABLE_PATH does not already contain PFT_name.
+PFT_RASTER_PATH <- "data/PFT/PFT_classes.tif"
+TEMPLATE_RASTER_PATH <- "outputs/tac_calculation/TAC_trend.tif"
+
+OUTPUT_DIR <- "outputs/PFT_drought_greening_analysis"
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# Broad PFT groups used in the public workflow.
+PFT_LEVELS <- c("Forest", "Grassland", "Shrubland / savanna")
+
+# PFT raster coding. Modify this section for your own PFT product.
+PFT_CODE_LOOKUP <- c(
+  "1" = "Forest",
+  "2" = "Shrubland / savanna",
+  "3" = "Grassland"
+)
+
+GREENING_LEVELS <- c(
+  "Low/negative kNDVI trend",
+  "Intermediate kNDVI trend",
+  "High positive kNDVI trend"
+)
+
+TRAIT_INFO <- data.frame(
+  Trait = c(
+    "Drought frequency",
+    "Mean drought severity",
+    "Mean drought duration"
+  ),
+  Trait_variable = c(
+    "Total_Drought_Count_z",
+    "SUB_Severity_z",
+    "SUB_Duration_z"
+  ),
+  Trait_label = c("Frequency", "Severity", "Duration"),
+  stringsAsFactors = FALSE
+)
+
+# Quantiles used for high-minus-low contrasts.
+Q_LOW <- 0.10
+Q_HIGH <- 0.90
+
+# Sample-size filters for fitting PFT-specific models.
+MIN_TOTAL_N <- 150
+MIN_GROUP_N <- 30
+
+# Model smoothness settings. These are deliberately generic for public use.
+K_UNIVARIATE <- 6
+K_SPACE <- 80
+
+# ============================================================
+# 2. Helper functions
+# ============================================================
+
+scale_safe <- function(x) {
+  x <- as.numeric(x)
+  s <- stats::sd(x, na.rm = TRUE)
+  m <- mean(x, na.rm = TRUE)
+  if (!is.finite(s) || s == 0) return(rep(0, length(x)))
+  (x - m) / s
+}
+
+safe_factor <- function(x, levels) {
+  factor(as.character(x), levels = levels)
+}
+
+align_to_template <- function(r, template, method = "near") {
+  if (is.character(r)) r <- terra::rast(r)
+  if (!terra::same.crs(r, template)) {
+    r <- terra::project(r, template, method = method)
+  }
+  if (!terra::compareGeom(
+    r, template,
+    stopOnError = FALSE,
+    crs = TRUE, ext = TRUE, rowcol = TRUE, res = TRUE
+  )) {
+    r <- terra::resample(r, template, method = method)
+  }
+  r
+}
+
+fit_pft_gam <- function(dat) {
+  mgcv::bam(
+    TAC_z ~
+      greening_rate_class +
+      s(AMT_z, k = K_UNIVARIATE) +
+      s(GSVPD_z, k = K_UNIVARIATE) +
+      s(PS_z, k = K_UNIVARIATE) +
+      s(IVP_z, k = K_UNIVARIATE) +
+      clim4_name +
+      s(x, y, k = K_SPACE) +
+      s(kNDVI_mean_z, k = K_UNIVARIATE) +
+      s(Total_Drought_Count_z, by = greening_rate_class, k = K_UNIVARIATE) +
+      s(SUB_Severity_z, by = greening_rate_class, k = K_UNIVARIATE) +
+      s(SUB_Duration_z, by = greening_rate_class, k = K_UNIVARIATE),
+    family = gaussian(),
+    data = dat,
+    method = "fREML",
+    discrete = TRUE
+  )
+}
+
+make_base_newdata <- function(dat, n = 1) {
+  most_common_zone <- names(sort(table(dat$clim4_name), decreasing = TRUE))[1]
+
+  nd <- data.frame(
+    AMT_z = rep(median(dat$AMT_z, na.rm = TRUE), n),
+    GSVPD_z = rep(median(dat$GSVPD_z, na.rm = TRUE), n),
+    PS_z = rep(median(dat$PS_z, na.rm = TRUE), n),
+    IVP_z = rep(median(dat$IVP_z, na.rm = TRUE), n),
+    kNDVI_mean_z = rep(median(dat$kNDVI_mean_z, na.rm = TRUE), n),
+    Total_Drought_Count_z = rep(median(dat$Total_Drought_Count_z, na.rm = TRUE), n),
+    SUB_Severity_z = rep(median(dat$SUB_Severity_z, na.rm = TRUE), n),
+    SUB_Duration_z = rep(median(dat$SUB_Duration_z, na.rm = TRUE), n),
+    x = rep(median(dat$x, na.rm = TRUE), n),
+    y = rep(median(dat$y, na.rm = TRUE), n)
+  )
+
+  nd$clim4_name <- factor(
+    rep(most_common_zone, n),
+    levels = levels(dat$clim4_name)
+  )
+
+  nd$greening_rate_class <- factor(
+    rep("Intermediate kNDVI trend", n),
+    levels = levels(dat$greening_rate_class)
+  )
+
+  nd
+}
+
+linear_contrast <- function(fit, newdat, weights) {
+  Xp <- predict(fit, newdata = newdat, type = "lpmatrix")
+  b <- coef(fit)
+  Vp <- fit$Vp
+
+  weights <- as.numeric(weights)
+  d <- as.numeric(t(weights) %*% Xp)
+
+  est <- sum(d * b)
+  se <- sqrt(as.numeric(d %*% Vp %*% d))
+
+  data.frame(
+    estimate = est,
+    se = se,
+    lwr = est - 1.96 * se,
+    upr = est + 1.96 * se,
+    p_value = 2 * pnorm(-abs(est / se))
+  )
+}
+
+contrast_trait_by_greening <- function(fit, dat, pft_name) {
+  out <- list()
+  idx <- 1
+
+  for (st in levels(dat$greening_rate_class)) {
+    for (i in seq_len(nrow(TRAIT_INFO))) {
+      trait_var <- TRAIT_INFO$Trait_variable[i]
+
+      q_low <- as.numeric(quantile(dat[[trait_var]], Q_LOW, na.rm = TRUE))
+      q_high <- as.numeric(quantile(dat[[trait_var]], Q_HIGH, na.rm = TRUE))
+
+      nd <- make_base_newdata(dat, n = 2)
+      nd$greening_rate_class <- factor(st, levels = levels(dat$greening_rate_class))
+      nd[[trait_var]] <- c(q_low, q_high)
+
+      eff <- linear_contrast(
+        fit = fit,
+        newdat = nd,
+        weights = c(-1, 1)
+      )
+
+      eff$PFT_name <- pft_name
+      eff$Greening_rate_class <- st
+      eff$Trait <- TRAIT_INFO$Trait[i]
+      eff$Trait_label <- TRAIT_INFO$Trait_label[i]
+      eff$Trait_variable <- trait_var
+      eff$Low_q <- Q_LOW
+      eff$High_q <- Q_HIGH
+      eff$Low_value_z <- q_low
+      eff$High_value_z <- q_high
+
+      out[[idx]] <- eff
+      idx <- idx + 1
+    }
+  }
+
+  dplyr::bind_rows(out)
+}
+
+compare_high_low_greening <- function(fit, dat, pft_name) {
+  low_state <- "Low/negative kNDVI trend"
+  high_state <- "High positive kNDVI trend"
+
+  out <- list()
+
+  for (i in seq_len(nrow(TRAIT_INFO))) {
+    trait_var <- TRAIT_INFO$Trait_variable[i]
+
+    q_low <- as.numeric(quantile(dat[[trait_var]], Q_LOW, na.rm = TRUE))
+    q_high <- as.numeric(quantile(dat[[trait_var]], Q_HIGH, na.rm = TRUE))
+
+    nd <- make_base_newdata(dat, n = 4)
+    nd$greening_rate_class <- factor(
+      c(high_state, high_state, low_state, low_state),
+      levels = levels(dat$greening_rate_class)
+    )
+    nd[[trait_var]] <- c(q_low, q_high, q_low, q_high)
+
+    eff <- linear_contrast(
+      fit = fit,
+      newdat = nd,
+      weights = c(-1, 1, 1, -1)
+    )
+
+    eff$PFT_name <- pft_name
+    eff$Trait <- TRAIT_INFO$Trait[i]
+    eff$Trait_label <- TRAIT_INFO$Trait_label[i]
+    eff$Trait_variable <- trait_var
+    eff$Contrast <- "High positive greening effect minus low/negative greening effect"
+
+    out[[i]] <- eff
+  }
+
+  dplyr::bind_rows(out)
+}
+
+make_marginal_curve <- function(fit, dat, pft_name, trait_var, n = 120) {
+  x_seq <- seq(
+    quantile(dat[[trait_var]], 0.05, na.rm = TRUE),
+    quantile(dat[[trait_var]], 0.95, na.rm = TRUE),
+    length.out = n
+  )
+
+  out <- list()
+  idx <- 1
+
+  for (st in levels(dat$greening_rate_class)) {
+    nd <- make_base_newdata(dat, n = length(x_seq))
+    nd$greening_rate_class <- factor(st, levels = levels(dat$greening_rate_class))
+    nd[[trait_var]] <- x_seq
+
+    # Hold the other drought traits at their PFT-specific median values.
+    for (v in setdiff(TRAIT_INFO$Trait_variable, trait_var)) {
+      nd[[v]] <- median(dat[[v]], na.rm = TRUE)
+    }
+
+    pr <- predict(fit, newdata = nd, se.fit = TRUE, type = "response")
+
+    tmp <- data.frame(
+      PFT_name = pft_name,
+      Greening_rate_class = st,
+      Trait_variable = trait_var,
+      Trait_value_z = x_seq,
+      fit = as.numeric(pr$fit),
+      lwr = as.numeric(pr$fit - 1.96 * pr$se.fit),
+      upr = as.numeric(pr$fit + 1.96 * pr$se.fit)
+    )
+
+    # Relative curve: use the low end of the drought-trait gradient as reference.
+    tmp$fit_ref <- tmp$fit[1]
+    tmp$fit_rel <- tmp$fit - tmp$fit_ref
+    tmp$lwr_rel <- tmp$lwr - tmp$fit_ref
+    tmp$upr_rel <- tmp$upr - tmp$fit_ref
+
+    out[[idx]] <- tmp
+    idx <- idx + 1
+  }
+
+  dplyr::bind_rows(out)
+}
+
+# ============================================================
+# 3. Read data and attach PFT classes
+# ============================================================
+
+if (!file.exists(MODEL_TABLE_PATH)) {
+  stop("Model table not found. Please update MODEL_TABLE_PATH.")
+}
+
+df <- data.table::fread(MODEL_TABLE_PATH) |> as.data.frame()
+
+required_cols <- c(
+  "x", "y", "TAC_z",
+  "AMT_z", "GSVPD_z", "PS_z", "IVP_z",
+  "kNDVI_mean_z",
+  "Total_Drought_Count_z", "SUB_Severity_z", "SUB_Duration_z",
+  "clim4_name", "greening_rate_class"
+)
+
+missing_cols <- setdiff(required_cols, names(df))
+if (length(missing_cols) > 0) {
+  stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
+}
+
+# Optional extraction from a PFT raster. If PFT_name already exists, this block is skipped.
+if (!"PFT_name" %in% names(df)) {
+  if (!file.exists(PFT_RASTER_PATH) || !file.exists(TEMPLATE_RASTER_PATH)) {
+    stop("PFT_name is missing from the table. Provide PFT_RASTER_PATH and TEMPLATE_RASTER_PATH.")
+  }
+
+  template <- terra::rast(TEMPLATE_RASTER_PATH)
+  r_pft <- align_to_template(PFT_RASTER_PATH, template, method = "near")
+
+  pts <- terra::vect(
+    df[, c("x", "y")],
+    geom = c("x", "y"),
+    crs = terra::crs(template)
+  )
+
+  pft_values <- terra::extract(r_pft, pts)[, 2]
+  df$PFT_code <- as.character(round(pft_values))
+  df$PFT_name <- unname(PFT_CODE_LOOKUP[df$PFT_code])
+}
+
+df <- df |>
+  dplyr::filter(
+    PFT_name %in% PFT_LEVELS,
+    is.finite(TAC_z),
+    is.finite(AMT_z),
+    is.finite(GSVPD_z),
+    is.finite(PS_z),
+    is.finite(IVP_z),
+    is.finite(kNDVI_mean_z),
+    is.finite(Total_Drought_Count_z),
+    is.finite(SUB_Severity_z),
+    is.finite(SUB_Duration_z),
+    is.finite(x),
+    is.finite(y),
+    !is.na(clim4_name),
+    !is.na(greening_rate_class)
+  ) |>
+  dplyr::mutate(
+    PFT_name = factor(PFT_name, levels = PFT_LEVELS),
+    greening_rate_class = factor(greening_rate_class, levels = GREENING_LEVELS),
+    clim4_name = factor(clim4_name)
+  )
+
+data.table::fwrite(
+  df,
+  file.path(OUTPUT_DIR, "PFT_model_table.csv")
+)
+
+pft_counts <- df |>
+  dplyr::count(PFT_name, greening_rate_class, name = "n_pixels") |>
+  dplyr::group_by(PFT_name) |>
+  dplyr::mutate(percentage_within_PFT = 100 * n_pixels / sum(n_pixels)) |>
+  dplyr::ungroup()
+
+data.table::fwrite(
+  pft_counts,
+  file.path(OUTPUT_DIR, "PFT_by_greening_class_sample_size.csv")
+)
+
+# ============================================================
+# 4. Fit PFT-specific models
+# ============================================================
+
+all_stats <- list()
+all_effects <- list()
+all_diffs <- list()
+all_curves <- list()
+
+run_id <- 1
+
+for (pft_i in PFT_LEVELS) {
+  message("[PFT] ", pft_i)
+
+  dat_pft <- df |>
+    dplyr::filter(PFT_name == pft_i) |>
+    droplevels()
+
+  if (nrow(dat_pft) < MIN_TOTAL_N) {
+    message("  skipped: small total sample size.")
+    next
+  }
+
+  group_counts <- table(dat_pft$greening_rate_class)
+  if (any(group_counts < MIN_GROUP_N)) {
+    message("  skipped: at least one greening-rate group is too small.")
+    next
+  }
+
+  fit <- fit_pft_gam(dat_pft)
+
+  model_name <- paste0("PFT_GAM_", gsub("[^A-Za-z0-9]+", "_", pft_i))
+
+  saveRDS(
+    fit,
+    file.path(OUTPUT_DIR, paste0(model_name, ".rds"))
+  )
+
+  sm <- summary(fit)
+  all_stats[[run_id]] <- data.frame(
+    PFT_name = pft_i,
+    Model = model_name,
+    N = nobs(fit),
+    AIC = AIC(fit),
+    Deviance_explained = sm$dev.expl,
+    Adjusted_R2 = sm$r.sq
+  )
+
+  all_effects[[run_id]] <- contrast_trait_by_greening(
+    fit = fit,
+    dat = dat_pft,
+    pft_name = pft_i
+  )
+
+  all_diffs[[run_id]] <- compare_high_low_greening(
+    fit = fit,
+    dat = dat_pft,
+    pft_name = pft_i
+  )
+
+  all_curves[[run_id]] <- make_marginal_curve(
+    fit = fit,
+    dat = dat_pft,
+    pft_name = pft_i,
+    trait_var = "SUB_Duration_z"
+  )
+
+  run_id <- run_id + 1
+}
+
+model_stats <- dplyr::bind_rows(all_stats)
+trait_effects <- dplyr::bind_rows(all_effects)
+greening_differences <- dplyr::bind_rows(all_diffs)
+duration_curves <- dplyr::bind_rows(all_curves)
+
+# Add BH-adjusted p values within each PFT.
+trait_effects <- trait_effects |>
+  dplyr::group_by(PFT_name) |>
+  dplyr::mutate(
+    p_adj_BH = p.adjust(p_value, method = "BH"),
+    significance_BH = dplyr::case_when(
+      p_adj_BH < 0.001 ~ "***",
+      p_adj_BH < 0.01 ~ "**",
+      p_adj_BH < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  ) |>
+  dplyr::ungroup()
+
+greening_differences <- greening_differences |>
+  dplyr::group_by(PFT_name) |>
+  dplyr::mutate(
+    p_adj_BH = p.adjust(p_value, method = "BH"),
+    significance_BH = dplyr::case_when(
+      p_adj_BH < 0.001 ~ "***",
+      p_adj_BH < 0.01 ~ "**",
+      p_adj_BH < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  ) |>
+  dplyr::ungroup()
+
+data.table::fwrite(model_stats, file.path(OUTPUT_DIR, "PFT_GAM_model_stats.csv"))
+data.table::fwrite(trait_effects, file.path(OUTPUT_DIR, "PFT_drought_trait_effects_by_greening_class.csv"))
+data.table::fwrite(greening_differences, file.path(OUTPUT_DIR, "PFT_high_minus_low_greening_effect_difference.csv"))
+data.table::fwrite(duration_curves, file.path(OUTPUT_DIR, "PFT_duration_marginal_curves_relative.csv"))
+
+# ============================================================
+# 5. Basic figures
+# ============================================================
+
+if (nrow(trait_effects) > 0) {
+  p_duration_effects <- trait_effects |>
+    dplyr::filter(Trait == "Mean drought duration") |>
+    ggplot2::ggplot(
+      ggplot2::aes(
+        x = greening_rate_class,
+        y = estimate,
+        color = PFT_name
+      )
+    ) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed") +
+    ggplot2::geom_errorbar(
+      ggplot2::aes(ymin = lwr, ymax = upr),
+      width = 0.12
+    ) +
+    ggplot2::geom_point(size = 2.5) +
+    ggplot2::facet_wrap(~ PFT_name, nrow = 1) +
+    ggplot2::labs(
+      x = NULL,
+      y = "High-minus-low effect on standardized TAC trend"
+    ) +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(angle = 25, hjust = 1),
+      legend.position = "none"
+    )
+
+  ggplot2::ggsave(
+    file.path(OUTPUT_DIR, "PFT_duration_effects_by_greening_class.png"),
+    p_duration_effects,
+    width = 10,
+    height = 4.8,
+    dpi = 300,
+    bg = "white"
+  )
+}
+
+if (nrow(duration_curves) > 0) {
+  p_duration_curves <- duration_curves |>
+    ggplot2::ggplot(
+      ggplot2::aes(
+        x = Trait_value_z,
+        y = fit_rel,
+        color = greening_rate_class,
+        fill = greening_rate_class
+      )
+    ) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed") +
+    ggplot2::geom_ribbon(
+      ggplot2::aes(ymin = lwr_rel, ymax = upr_rel),
+      alpha = 0.12,
+      color = NA
+    ) +
+    ggplot2::geom_line(linewidth = 0.8) +
+    ggplot2::facet_wrap(~ PFT_name, nrow = 1) +
+    ggplot2::labs(
+      x = "Standardized mean drought duration",
+      y = "Change in predicted standardized TAC trend\nrelative to low drought duration",
+      color = "Greening-rate class",
+      fill = "Greening-rate class"
+    ) +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::theme(
+      legend.position = "bottom"
+    )
+
+  ggplot2::ggsave(
+    file.path(OUTPUT_DIR, "PFT_duration_relative_marginal_curves.png"),
+    p_duration_curves,
+    width = 10,
+    height = 5,
+    dpi = 300,
+    bg = "white"
+  )
+}
+
+message("[DONE] PFT-specific drought-greening TAC analysis finished.")
+message("Outputs saved to: ", OUTPUT_DIR)
