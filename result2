@@ -1,0 +1,673 @@
+# ============================================================
+# Public workflow: drought traits, vegetation greening, and TAC trend
+# ============================================================
+#
+# Purpose
+# -------
+# This script outlines the main analytical workflow used to test whether
+# drought-history traits are associated with changes in vegetation local
+# recovery dynamics, represented here by the trend in lag-1 temporal
+# autocorrelation (TAC).
+#
+# Main questions
+# --------------
+# 1. Are drought frequency, mean severity, and mean duration associated
+#    with the TAC trend after controlling for climate, vegetation state,
+#    and broad spatial structure?
+# 2. Do these drought effects differ across vegetation greening-rate
+#    classes?
+#
+# Notes for public release
+# ------------------------
+# - Replace the placeholder paths in Section 1 with your own data paths.
+# - Large raster inputs are not included in this repository.
+# - Project-specific local paths, figure styling details, and manuscript-
+#   specific polishing code have been removed.
+# - This script is intended as a transparent workflow template rather than
+#   a fully plug-and-play reproduction package.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 0. Packages
+# ------------------------------------------------------------
+
+required_packages <- c(
+  "terra", "sf", "data.table", "dplyr", "ggplot2",
+  "mgcv", "readr", "tibble", "tidyr", "stringr"
+)
+
+to_install <- setdiff(required_packages, rownames(installed.packages()))
+if (length(to_install) > 0) {
+  install.packages(to_install, repos = "https://cloud.r-project.org")
+}
+
+suppressPackageStartupMessages({
+  invisible(lapply(required_packages, library, character.only = TRUE))
+})
+
+
+# ------------------------------------------------------------
+# 1. User settings
+# ------------------------------------------------------------
+
+# Main directories
+DATA_DIR <- "data"
+OUTPUT_ROOT <- "outputs/drought_traits_TAC_state_dependence"
+
+dir.create(OUTPUT_ROOT, recursive = TRUE, showWarnings = FALSE)
+
+# Core raster inputs
+# TAC_TREND_PATH should be the raster of TAC trend, for example the slope of
+# rolling-window lag-1 TAC through time. Positive values indicate increasing TAC.
+TAC_TREND_PATH <- file.path(DATA_DIR, "tac", "tac_trend.tif")
+
+# Vegetation-state products
+VEG_MEAN_PATH  <- file.path(DATA_DIR, "vegetation", "mean_kNDVI.tif")
+VEG_SLOPE_PATH <- file.path(DATA_DIR, "vegetation", "kNDVI_trend.tif")
+
+# Background climate controls
+CLIMATE_PATHS <- list(
+  mean_temperature = file.path(DATA_DIR, "climate", "mean_temperature.tif"),
+  vapor_pressure_deficit = file.path(DATA_DIR, "climate", "vpd.tif"),
+  precipitation_seasonality = file.path(DATA_DIR, "climate", "precipitation_seasonality.tif"),
+  precipitation_variability = file.path(DATA_DIR, "climate", "precipitation_variability.tif")
+)
+
+# Climate-zone layer.
+# This can be either a polygon vector file or a raster aligned to the study grid.
+CLIMATE_ZONE_PATH <- file.path(DATA_DIR, "zones", "climate_zones.shp")
+CLIMATE_ZONE_FIELD <- "zone_id"
+
+# Drought metrics for alternative drought definitions or seasons.
+# Each raster should contain, at minimum, three bands:
+#   Total_Drought_Count, SUB_Severity, SUB_Duration
+DROUGHT_METRICS <- list(
+  growing_season = file.path(DATA_DIR, "drought", "growing_season_drought_metrics.tif"),
+  annual = file.path(DATA_DIR, "drought", "annual_drought_metrics.tif")
+)
+
+RUN_DROUGHT_MODES <- names(DROUGHT_METRICS)
+
+# Expected drought metric names.
+# If your input raster already has correct band names, this is only used as a check.
+DROUGHT_BAND_NAMES <- c(
+  "Total_Drought_Count",
+  "SUB_Severity",
+  "SUB_Duration"
+)
+
+# Analysis settings
+K_SMOOTH <- 6
+SPATIAL_K <- 80
+CONTRAST_QUANTILES <- c(0.10, 0.90)
+
+# Set TRUE for a lighter public demonstration. For full analysis, use FALSE.
+RUN_SPATIAL_BLOCK_CV <- FALSE
+SPATIAL_K_FOLDS <- 5
+SPATIAL_BLOCK_SIZE_DEG <- 2
+
+
+# ------------------------------------------------------------
+# 2. Helper functions
+# ------------------------------------------------------------
+
+check_exists <- function(paths) {
+  missing_paths <- paths[!file.exists(paths)]
+  if (length(missing_paths) > 0) {
+    stop(
+      "The following input files are missing:\n",
+      paste(missing_paths, collapse = "\n")
+    )
+  }
+}
+
+scale_vec <- function(x) {
+  x <- as.numeric(x)
+  m <- mean(x, na.rm = TRUE)
+  s <- stats::sd(x, na.rm = TRUE)
+  if (!is.finite(s) || s == 0) return(rep(0, length(x)))
+  (x - m) / s
+}
+
+rmse <- function(obs, pred) {
+  sqrt(mean((obs - pred)^2, na.rm = TRUE))
+}
+
+r2_pred <- function(obs, pred) {
+  1 - sum((obs - pred)^2, na.rm = TRUE) /
+    sum((obs - mean(obs, na.rm = TRUE))^2, na.rm = TRUE)
+}
+
+align_to_template <- function(path_or_raster, template, method = "bilinear") {
+  r <- if (inherits(path_or_raster, "SpatRaster")) path_or_raster else terra::rast(path_or_raster)
+
+  if (!terra::same.crs(r, template)) {
+    r <- terra::project(r, template, method = method)
+  }
+
+  if (!terra::compareGeom(
+    r, template,
+    stopOnError = FALSE,
+    crs = TRUE, ext = TRUE, rowcol = TRUE, res = TRUE
+  )) {
+    r <- terra::resample(r, template, method = method)
+  }
+
+  r
+}
+
+make_tertile_class <- function(x, labels) {
+  q <- unique(stats::quantile(x, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE))
+
+  if (length(q) < 4) {
+    idx <- dplyr::ntile(x, 3)
+    return(factor(labels[idx], levels = labels))
+  }
+
+  cut(x, breaks = q, include.lowest = TRUE, labels = labels)
+}
+
+fit_bam <- function(formula_obj, dat) {
+  mgcv::bam(
+    formula_obj,
+    family = gaussian(),
+    data = dat,
+    method = "fREML",
+    discrete = TRUE
+  )
+}
+
+extract_model_stats <- function(fit, model_name) {
+  sm <- summary(fit)
+  data.frame(
+    model = model_name,
+    AIC = AIC(fit),
+    deviance_explained = sm$dev.expl,
+    adjusted_R2 = sm$r.sq,
+    n = nobs(fit),
+    row.names = NULL
+  )
+}
+
+extract_smooth_terms <- function(fit, model_name) {
+  sm <- summary(fit)
+  out <- as.data.frame(sm$s.table)
+  out$smooth_term <- rownames(out)
+  out$model <- model_name
+  rownames(out) <- NULL
+  out
+}
+
+linear_contrast <- function(fit, newdat, weights) {
+  Xp <- predict(fit, newdata = newdat, type = "lpmatrix")
+  beta <- coef(fit)
+  Vp <- fit$Vp
+
+  weights <- as.numeric(weights)
+  d <- as.numeric(t(weights) %*% Xp)
+
+  estimate <- sum(d * beta)
+  se <- sqrt(as.numeric(d %*% Vp %*% d))
+
+  data.frame(
+    estimate = estimate,
+    se = se,
+    lwr = estimate - 1.96 * se,
+    upr = estimate + 1.96 * se,
+    p_value = 2 * pnorm(-abs(estimate / se))
+  )
+}
+
+extract_climate_zone <- function(df_xy, template) {
+  message("[INFO] Extracting climate-zone information...")
+
+  # Raster zone layer
+  if (grepl("\\.tif$|\\.tiff$", CLIMATE_ZONE_PATH, ignore.case = TRUE)) {
+    r_zone <- align_to_template(CLIMATE_ZONE_PATH, template, method = "near")
+    names(r_zone) <- "zone_id"
+    pts <- terra::vect(df_xy[, c("x", "y")], geom = c("x", "y"), crs = terra::crs(template))
+    z <- terra::extract(r_zone, pts)
+    return(as.integer(z$zone_id))
+  }
+
+  # Vector zone layer
+  zones <- terra::vect(CLIMATE_ZONE_PATH)
+  pts <- terra::vect(df_xy[, c("x", "y")], geom = c("x", "y"), crs = terra::crs(template))
+
+  if (!terra::same.crs(zones, pts)) {
+    zones <- terra::project(zones, terra::crs(pts))
+  }
+
+  z <- terra::extract(zones, pts)
+
+  if (!CLIMATE_ZONE_FIELD %in% names(z)) {
+    stop("CLIMATE_ZONE_FIELD not found in climate-zone layer.")
+  }
+
+  as.integer(z[[CLIMATE_ZONE_FIELD]])
+}
+
+make_base_newdata <- function(df_model, n = 1) {
+  most_common_zone <- names(sort(table(df_model$zone_name), decreasing = TRUE))[1]
+
+  nd <- data.frame(
+    AMT_z = rep(stats::median(df_model$AMT_z, na.rm = TRUE), n),
+    VPD_z = rep(stats::median(df_model$VPD_z, na.rm = TRUE), n),
+    PS_z = rep(stats::median(df_model$PS_z, na.rm = TRUE), n),
+    IVP_z = rep(stats::median(df_model$IVP_z, na.rm = TRUE), n),
+    kNDVI_mean_z = rep(stats::median(df_model$kNDVI_mean_z, na.rm = TRUE), n),
+    kNDVI_slope_z = rep(stats::median(df_model$kNDVI_slope_z, na.rm = TRUE), n),
+    Total_Drought_Count_z = rep(stats::median(df_model$Total_Drought_Count_z, na.rm = TRUE), n),
+    SUB_Severity_z = rep(stats::median(df_model$SUB_Severity_z, na.rm = TRUE), n),
+    SUB_Duration_z = rep(stats::median(df_model$SUB_Duration_z, na.rm = TRUE), n),
+    x = rep(stats::median(df_model$x, na.rm = TRUE), n),
+    y = rep(stats::median(df_model$y, na.rm = TRUE), n)
+  )
+
+  nd$zone_name <- factor(rep(most_common_zone, n), levels = levels(df_model$zone_name))
+  nd$greening_rate_class <- factor(
+    rep("Intermediate greening", n),
+    levels = levels(df_model$greening_rate_class)
+  )
+
+  nd
+}
+
+
+# ------------------------------------------------------------
+# 3. Build model table
+# ------------------------------------------------------------
+
+build_model_table <- function(drought_mode, drought_path) {
+  message("\n============================================================")
+  message("[MODE] ", drought_mode)
+  message("============================================================")
+
+  out_dir <- file.path(OUTPUT_ROOT, drought_mode)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  check_exists(c(
+    TAC_TREND_PATH,
+    VEG_MEAN_PATH,
+    VEG_SLOPE_PATH,
+    unlist(CLIMATE_PATHS),
+    CLIMATE_ZONE_PATH,
+    drought_path
+  ))
+
+  template <- terra::rast(TAC_TREND_PATH)
+  names(template) <- "TAC_trend"
+
+  r_tac <- align_to_template(TAC_TREND_PATH, template, method = "bilinear")
+  names(r_tac) <- "TAC_trend"
+
+  r_mean <- align_to_template(VEG_MEAN_PATH, template, method = "bilinear")
+  names(r_mean) <- "kNDVI_mean"
+
+  r_slope <- align_to_template(VEG_SLOPE_PATH, template, method = "bilinear")
+  names(r_slope) <- "kNDVI_slope"
+
+  r_amt <- align_to_template(CLIMATE_PATHS$mean_temperature, template, method = "bilinear")
+  names(r_amt) <- "AMT"
+
+  r_vpd <- align_to_template(CLIMATE_PATHS$vapor_pressure_deficit, template, method = "bilinear")
+  names(r_vpd) <- "VPD"
+
+  r_ps <- align_to_template(CLIMATE_PATHS$precipitation_seasonality, template, method = "bilinear")
+  names(r_ps) <- "PS"
+
+  r_ivp <- align_to_template(CLIMATE_PATHS$precipitation_variability, template, method = "bilinear")
+  names(r_ivp) <- "IVP"
+
+  r_drought <- align_to_template(drought_path, template, method = "near")
+
+  if (terra::nlyr(r_drought) >= length(DROUGHT_BAND_NAMES)) {
+    names(r_drought)[seq_along(DROUGHT_BAND_NAMES)] <- DROUGHT_BAND_NAMES
+    r_drought <- r_drought[[DROUGHT_BAND_NAMES]]
+  } else {
+    stop("Drought metrics raster must contain at least three bands.")
+  }
+
+  stk <- c(r_tac, r_mean, r_slope, r_amt, r_vpd, r_ps, r_ivp, r_drought)
+
+  df <- as.data.frame(stk, xy = TRUE, na.rm = FALSE)
+  df <- data.table::as.data.table(df)
+  df <- df[is.finite(TAC_trend)]
+
+  # Fill no-event drought trait values with zero when appropriate.
+  drought_vars <- c("Total_Drought_Count", "SUB_Severity", "SUB_Duration")
+  for (v in drought_vars) {
+    df[[v]][!is.finite(df[[v]])] <- 0
+  }
+
+  df$zone_id <- extract_climate_zone(as.data.frame(df[, .(x, y)]), template)
+  df <- df[is.finite(zone_id)]
+  df$zone_name <- factor(paste0("Zone ", df$zone_id))
+
+  required_vars <- c(
+    "TAC_trend", "kNDVI_mean", "kNDVI_slope",
+    "AMT", "VPD", "PS", "IVP",
+    "Total_Drought_Count", "SUB_Severity", "SUB_Duration",
+    "x", "y"
+  )
+
+  df_model <- as.data.frame(df) |>
+    dplyr::filter(dplyr::if_all(dplyr::all_of(required_vars), is.finite))
+
+  df_model$greening_rate_class <- make_tertile_class(
+    df_model$kNDVI_slope,
+    labels = c("Low/negative greening", "Intermediate greening", "High positive greening")
+  )
+
+  df_model <- df_model |>
+    dplyr::mutate(
+      TAC_z = scale_vec(TAC_trend),
+      kNDVI_mean_z = scale_vec(kNDVI_mean),
+      kNDVI_slope_z = scale_vec(kNDVI_slope),
+      AMT_z = scale_vec(AMT),
+      VPD_z = scale_vec(VPD),
+      PS_z = scale_vec(PS),
+      IVP_z = scale_vec(IVP),
+      Total_Drought_Count_z = scale_vec(Total_Drought_Count),
+      SUB_Severity_z = scale_vec(SUB_Severity),
+      SUB_Duration_z = scale_vec(SUB_Duration)
+    )
+
+  readr::write_csv(
+    df_model,
+    file.path(out_dir, "model_table_drought_traits_TAC.csv")
+  )
+
+  message("[INFO] Model table rows: ", nrow(df_model))
+  df_model
+}
+
+
+# ------------------------------------------------------------
+# 4. Fit GAMs and extract drought effects
+# ------------------------------------------------------------
+
+fit_drought_models <- function(df_model, drought_mode) {
+  out_dir <- file.path(OUTPUT_ROOT, drought_mode)
+  model_dir <- file.path(out_dir, "models")
+  result_dir <- file.path(out_dir, "results")
+  fig_dir <- file.path(out_dir, "figures")
+
+  dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(result_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+  base_terms <- c(
+    paste0("s(AMT_z, k = ", K_SMOOTH, ")"),
+    paste0("s(VPD_z, k = ", K_SMOOTH, ")"),
+    paste0("s(PS_z, k = ", K_SMOOTH, ")"),
+    paste0("s(IVP_z, k = ", K_SMOOTH, ")"),
+    "zone_name",
+    paste0("s(x, y, k = ", SPATIAL_K, ")")
+  )
+
+  veg_terms <- c(
+    paste0("s(kNDVI_mean_z, k = ", K_SMOOTH, ")"),
+    paste0("s(kNDVI_slope_z, k = ", K_SMOOTH, ")")
+  )
+
+  drought_terms <- c(
+    paste0("s(Total_Drought_Count_z, k = ", K_SMOOTH, ")"),
+    paste0("s(SUB_Severity_z, k = ", K_SMOOTH, ")"),
+    paste0("s(SUB_Duration_z, k = ", K_SMOOTH, ")")
+  )
+
+  model_forms <- list(
+    M0_climate_space = as.formula(
+      paste("TAC_z ~", paste(base_terms, collapse = " + "))
+    ),
+    M1_vegetation_state = as.formula(
+      paste("TAC_z ~", paste(c(base_terms, veg_terms), collapse = " + "))
+    ),
+    M2_drought_traits = as.formula(
+      paste("TAC_z ~", paste(c(base_terms, veg_terms, drought_terms), collapse = " + "))
+    ),
+    M3_drought_by_greening = as.formula(
+      paste(
+        "TAC_z ~ greening_rate_class +",
+        paste(c(
+          base_terms,
+          paste0("s(kNDVI_mean_z, k = ", K_SMOOTH, ")"),
+          paste0("s(Total_Drought_Count_z, by = greening_rate_class, k = ", K_SMOOTH, ")"),
+          paste0("s(SUB_Severity_z, by = greening_rate_class, k = ", K_SMOOTH, ")"),
+          paste0("s(SUB_Duration_z, by = greening_rate_class, k = ", K_SMOOTH, ")")
+        ), collapse = " + ")
+      )
+    )
+  )
+
+  fits <- list()
+  model_stats <- list()
+  smooth_tables <- list()
+
+  for (nm in names(model_forms)) {
+    message("[FIT] ", drought_mode, " / ", nm)
+    fit <- fit_bam(model_forms[[nm]], df_model)
+    fits[[nm]] <- fit
+
+    saveRDS(fit, file.path(model_dir, paste0(nm, ".rds")))
+    capture.output(summary(fit), file = file.path(model_dir, paste0(nm, "_summary.txt")))
+
+    model_stats[[nm]] <- extract_model_stats(fit, nm)
+    smooth_tables[[nm]] <- extract_smooth_terms(fit, nm)
+  }
+
+  model_stats_df <- dplyr::bind_rows(model_stats) |>
+    dplyr::mutate(
+      drought_mode = drought_mode,
+      delta_AIC_vs_M1 = AIC - AIC[model == "M1_vegetation_state"],
+      delta_deviance_vs_M1 = deviance_explained - deviance_explained[model == "M1_vegetation_state"]
+    )
+
+  smooth_df <- dplyr::bind_rows(smooth_tables) |>
+    dplyr::mutate(drought_mode = drought_mode)
+
+  readr::write_csv(model_stats_df, file.path(result_dir, "model_comparison.csv"))
+  readr::write_csv(smooth_df, file.path(result_dir, "smooth_terms.csv"))
+
+  # Overall high-minus-low drought effects from M2
+  contrast_one_trait <- function(fit, trait_var_z, trait_label) {
+    low_v <- as.numeric(stats::quantile(df_model[[trait_var_z]], CONTRAST_QUANTILES[1], na.rm = TRUE))
+    high_v <- as.numeric(stats::quantile(df_model[[trait_var_z]], CONTRAST_QUANTILES[2], na.rm = TRUE))
+
+    nd <- make_base_newdata(df_model, 2)
+    nd[[trait_var_z]] <- c(low_v, high_v)
+
+    out <- linear_contrast(fit, nd, weights = c(-1, 1))
+    out$trait <- trait_label
+    out$trait_variable <- trait_var_z
+    out$drought_mode <- drought_mode
+    out
+  }
+
+  overall_effects <- dplyr::bind_rows(
+    contrast_one_trait(fits$M2_drought_traits, "Total_Drought_Count_z", "Drought frequency"),
+    contrast_one_trait(fits$M2_drought_traits, "SUB_Severity_z", "Mean drought severity"),
+    contrast_one_trait(fits$M2_drought_traits, "SUB_Duration_z", "Mean drought duration")
+  )
+
+  readr::write_csv(overall_effects, file.path(result_dir, "overall_drought_trait_effects.csv"))
+
+  # State-dependent effects from M3
+  contrast_by_greening <- function(fit, trait_var_z, trait_label) {
+    states <- levels(df_model$greening_rate_class)
+
+    out <- lapply(states, function(st) {
+      low_v <- as.numeric(stats::quantile(df_model[[trait_var_z]], CONTRAST_QUANTILES[1], na.rm = TRUE))
+      high_v <- as.numeric(stats::quantile(df_model[[trait_var_z]], CONTRAST_QUANTILES[2], na.rm = TRUE))
+
+      nd <- make_base_newdata(df_model, 2)
+      nd$greening_rate_class <- factor(st, levels = states)
+      nd[[trait_var_z]] <- c(low_v, high_v)
+
+      eff <- linear_contrast(fit, nd, weights = c(-1, 1))
+      eff$greening_rate_class <- st
+      eff$trait <- trait_label
+      eff$trait_variable <- trait_var_z
+      eff$drought_mode <- drought_mode
+      eff
+    })
+
+    dplyr::bind_rows(out)
+  }
+
+  state_effects <- dplyr::bind_rows(
+    contrast_by_greening(fits$M3_drought_by_greening, "Total_Drought_Count_z", "Drought frequency"),
+    contrast_by_greening(fits$M3_drought_by_greening, "SUB_Severity_z", "Mean drought severity"),
+    contrast_by_greening(fits$M3_drought_by_greening, "SUB_Duration_z", "Mean drought duration")
+  )
+
+  readr::write_csv(state_effects, file.path(result_dir, "drought_effects_by_greening_rate.csv"))
+
+  # Simple diagnostic figures
+  p_overall <- ggplot2::ggplot(overall_effects, ggplot2::aes(x = trait, y = estimate)) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed") +
+    ggplot2::geom_errorbar(ggplot2::aes(ymin = lwr, ymax = upr), width = 0.15) +
+    ggplot2::geom_point(size = 2.4) +
+    ggplot2::labs(x = NULL, y = "High-minus-low effect on standardized TAC trend") +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 20, hjust = 1))
+
+  ggplot2::ggsave(
+    file.path(fig_dir, "overall_drought_trait_effects.png"),
+    p_overall,
+    width = 6.5, height = 4.2, dpi = 300, bg = "white"
+  )
+
+  p_state <- ggplot2::ggplot(state_effects, ggplot2::aes(x = trait, y = estimate)) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed") +
+    ggplot2::geom_errorbar(ggplot2::aes(ymin = lwr, ymax = upr), width = 0.15) +
+    ggplot2::geom_point(size = 2.2) +
+    ggplot2::facet_wrap(~ greening_rate_class, nrow = 1) +
+    ggplot2::labs(x = NULL, y = "High-minus-low effect on standardized TAC trend") +
+    ggplot2::theme_bw(base_size = 12) +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 20, hjust = 1))
+
+  ggplot2::ggsave(
+    file.path(fig_dir, "drought_effects_by_greening_rate.png"),
+    p_state,
+    width = 10, height = 4.4, dpi = 300, bg = "white"
+  )
+
+  list(
+    fits = fits,
+    model_stats = model_stats_df,
+    overall_effects = overall_effects,
+    state_effects = state_effects
+  )
+}
+
+
+# ------------------------------------------------------------
+# 5. Optional spatial block cross-validation
+# ------------------------------------------------------------
+
+run_spatial_block_cv <- function(df_model, model_formula, drought_mode) {
+  message("[INFO] Running spatial block cross-validation for ", drought_mode)
+
+  set.seed(123)
+
+  df_cv <- df_model |>
+    dplyr::mutate(
+      block_x = floor(x / SPATIAL_BLOCK_SIZE_DEG),
+      block_y = floor(y / SPATIAL_BLOCK_SIZE_DEG),
+      block_id = paste(block_x, block_y, sep = "_")
+    )
+
+  block_table <- df_cv |>
+    dplyr::count(block_id, name = "n") |>
+    dplyr::arrange(dplyr::desc(n))
+
+  fold_load <- rep(0, SPATIAL_K_FOLDS)
+  block_table$fold <- NA_integer_
+
+  for (i in seq_len(nrow(block_table))) {
+    k <- which.min(fold_load)
+    block_table$fold[i] <- k
+    fold_load[k] <- fold_load[k] + block_table$n[i]
+  }
+
+  df_cv <- df_cv |>
+    dplyr::left_join(block_table[, c("block_id", "fold")], by = "block_id")
+
+  results <- lapply(seq_len(SPATIAL_K_FOLDS), function(k) {
+    train <- df_cv |> dplyr::filter(fold != k)
+    test <- df_cv |> dplyr::filter(fold == k)
+
+    fit <- fit_bam(model_formula, train)
+    pred <- predict(fit, newdata = test)
+
+    data.frame(
+      fold = k,
+      RMSE = rmse(test$TAC_z, pred),
+      R2 = r2_pred(test$TAC_z, pred),
+      n_test = nrow(test)
+    )
+  })
+
+  out <- dplyr::bind_rows(results)
+
+  cv_dir <- file.path(OUTPUT_ROOT, drought_mode, "spatial_block_cv")
+  dir.create(cv_dir, recursive = TRUE, showWarnings = FALSE)
+  readr::write_csv(out, file.path(cv_dir, "spatial_block_cv.csv"))
+
+  out
+}
+
+
+# ------------------------------------------------------------
+# 6. Run workflow
+# ------------------------------------------------------------
+
+all_results <- list()
+
+for (mode_name in RUN_DROUGHT_MODES) {
+  drought_path <- DROUGHT_METRICS[[mode_name]]
+
+  df_model <- build_model_table(
+    drought_mode = mode_name,
+    drought_path = drought_path
+  )
+
+  res <- fit_drought_models(
+    df_model = df_model,
+    drought_mode = mode_name
+  )
+
+  if (RUN_SPATIAL_BLOCK_CV) {
+    # Example: validate the additive drought-trait model.
+    cv_formula <- as.formula(
+      paste(
+        "TAC_z ~",
+        paste(c(
+          paste0("s(AMT_z, k = ", K_SMOOTH, ")"),
+          paste0("s(VPD_z, k = ", K_SMOOTH, ")"),
+          paste0("s(PS_z, k = ", K_SMOOTH, ")"),
+          paste0("s(IVP_z, k = ", K_SMOOTH, ")"),
+          paste0("s(kNDVI_mean_z, k = ", K_SMOOTH, ")"),
+          paste0("s(kNDVI_slope_z, k = ", K_SMOOTH, ")"),
+          paste0("s(Total_Drought_Count_z, k = ", K_SMOOTH, ")"),
+          paste0("s(SUB_Severity_z, k = ", K_SMOOTH, ")"),
+          paste0("s(SUB_Duration_z, k = ", K_SMOOTH, ")"),
+          "zone_name",
+          paste0("s(x, y, k = ", SPATIAL_K, ")")
+        ), collapse = " + ")
+      )
+    )
+
+    res$spatial_cv <- run_spatial_block_cv(df_model, cv_formula, mode_name)
+  }
+
+  all_results[[mode_name]] <- res
+}
+
+message("\n============================================================")
+message("[DONE] Drought-traits TAC state-dependence workflow finished.")
+message("Outputs saved to: ", OUTPUT_ROOT)
+message("============================================================")
