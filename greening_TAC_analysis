@@ -1,0 +1,596 @@
+# ============================================================
+# Greening status and TAC-SD-consistent local stability signals
+# Public workflow version
+#
+# Purpose
+#   1. Identify pixels with TAC-SD-consistent local stability decline signals.
+#   2. Classify vegetation greening status from monthly vegetation-index data.
+#   3. Compare decline-signal prevalence among greening, non-significant change,
+#      and browning groups.
+#   4. Test whether greening rate and mean greenness are associated with the
+#      probability of local stability decline after controlling for climate,
+#      extreme-event exposure, climate zone, and broad spatial structure.
+#
+# Notes
+#   - This is a simplified public version for GitHub.
+#   - Replace the example input paths with your own data paths.
+#   - Large raster files should not be stored directly in the GitHub repository.
+#   - The script keeps the core analytical logic while omitting project-specific
+#     paths, final publication styling, and manuscript-specific figure tuning.
+# ============================================================
+
+# ------------------------------------------------------------
+# 0. Packages
+# ------------------------------------------------------------
+required_packages <- c(
+  "terra", "sf", "dplyr", "data.table", "ggplot2",
+  "mgcv", "readr", "tibble", "parallel"
+)
+
+missing_packages <- setdiff(required_packages, rownames(installed.packages()))
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+
+suppressPackageStartupMessages({
+  invisible(lapply(required_packages, library, character.only = TRUE))
+})
+
+# ------------------------------------------------------------
+# 1. User settings
+# ------------------------------------------------------------
+# Replace these paths with your own data locations.
+# Example folder structure:
+#   data/
+#     tac/
+#     vegetation/
+#     climate/
+#     boundaries/
+#   outputs/
+
+DATA_DIR <- "data"
+OUTPUT_DIR <- file.path("outputs", "greening_TAC_SD_analysis")
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# TAC trend products.
+# RAW_TAC_TREND should contain the raw TAC trend used as the valid-pixel mask.
+# FILTERED_TAC_TREND should contain TAC trends retained after TAC-SD consistency filtering.
+RAW_TAC_TREND <- file.path(DATA_DIR, "tac", "raw_TAC_trend.tif")
+FILTERED_TAC_TREND <- file.path(DATA_DIR, "tac", "TAC_SD_consistent_TAC_trend.tif")
+
+# Monthly vegetation-index stack, ordered continuously in time.
+MONTHLY_VI <- file.path(DATA_DIR, "vegetation", "monthly_kNDVI.tif")
+
+# Climate / environmental controls.
+AMT_RASTER   <- file.path(DATA_DIR, "climate", "mean_temperature.tif")
+GSVPD_RASTER <- file.path(DATA_DIR, "climate", "growing_season_vpd.tif")
+PS_RASTER    <- file.path(DATA_DIR, "climate", "precipitation_seasonality.tif")
+IVP_RASTER   <- file.path(DATA_DIR, "climate", "precipitation_interannual_variability.tif")
+HEAT_RASTER  <- file.path(DATA_DIR, "climate", "extreme_heat_exposure.tif")
+DRY_RASTER   <- file.path(DATA_DIR, "climate", "extreme_drought_exposure.tif")
+
+# Climate-zone polygon layer. It should contain a categorical field such as clim4.
+CLIMATE_ZONE_SHP <- file.path(DATA_DIR, "boundaries", "climate_zones.shp")
+CLIMATE_ZONE_FIELD <- "clim4"
+CLIMATE_ZONE_LABELS <- c("Humid", "Semi-humid", "Semi-arid", "Arid")
+
+# Time metadata for the monthly vegetation-index stack.
+START_DATE <- as.Date("2000-02-01")
+END_YEAR <- 2020
+
+# Analysis options. These are intentionally generic for the public version.
+MIN_VALID_FRACTION <- 0.60
+MAX_MODEL_SAMPLE <- 300000
+RANDOM_SEED <- 123
+
+# Parallel settings.
+USER_N_CORES <- max(1, parallel::detectCores() - 1)
+N_THREADS <- USER_N_CORES
+data.table::setDTthreads(N_THREADS)
+terra::terraOptions(memfrac = 0.75, progress = 1)
+set.seed(RANDOM_SEED)
+
+cat("[INFO] Output directory:", OUTPUT_DIR, "\n")
+cat("[INFO] Using threads:", N_THREADS, "\n")
+
+# ------------------------------------------------------------
+# 2. Helper functions
+# ------------------------------------------------------------
+check_files <- function(paths) {
+  file_table <- data.frame(
+    path = paths,
+    exists = file.exists(paths),
+    stringsAsFactors = FALSE
+  )
+  print(file_table)
+  if (any(!file_table$exists)) {
+    stop("Some required input files are missing. Update paths in Section 1.")
+  }
+}
+
+align_to_template <- function(path_or_raster, template, method = "bilinear") {
+  r <- if (inherits(path_or_raster, "SpatRaster")) path_or_raster else terra::rast(path_or_raster)
+
+  if (!terra::same.crs(r, template)) {
+    r <- terra::project(r, template, method = method)
+  }
+
+  if (!terra::compareGeom(
+    r, template,
+    stopOnError = FALSE,
+    crs = TRUE, ext = TRUE, rowcol = TRUE, res = TRUE
+  )) {
+    r <- terra::resample(r, template, method = method)
+  }
+
+  r
+}
+
+safe_pct <- function(num, den) {
+  ifelse(den > 0, 100 * num / den, NA_real_)
+}
+
+scale_vec <- function(x) {
+  x <- as.numeric(x)
+  s <- sd(x, na.rm = TRUE)
+  m <- mean(x, na.rm = TRUE)
+  if (!is.finite(s) || s == 0) return(rep(0, length(x)))
+  (x - m) / s
+}
+
+make_trend_fun <- function(time_vector, min_valid_fraction = 0.60) {
+  force(time_vector)
+  force(min_valid_fraction)
+
+  function(v) {
+    ok <- is.finite(v)
+    if (sum(ok) < ceiling(length(v) * min_valid_fraction)) {
+      return(c(NA_real_, NA_real_))
+    }
+    if (length(unique(v[ok])) < 2) {
+      return(c(NA_real_, NA_real_))
+    }
+
+    fit <- tryCatch(lm(v[ok] ~ time_vector[ok]), error = function(e) NULL)
+    if (is.null(fit)) return(c(NA_real_, NA_real_))
+
+    sm <- summary(fit)
+    c(
+      slope = unname(coef(sm)[2, 1]),
+      p_value = unname(coef(sm)[2, 4])
+    )
+  }
+}
+
+make_tertile_class <- function(x, labels) {
+  q <- unique(quantile(x, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE))
+  if (length(q) < 4) {
+    idx <- dplyr::ntile(x, 3)
+    return(factor(labels[idx], levels = labels))
+  }
+  cut(x, breaks = q, include.lowest = TRUE, labels = labels)
+}
+
+odds_ratio_table <- function(a, b, c, d, label1, label0) {
+  # a/c: decline counts; b/d: non-decline counts.
+  aa <- a + 0.5
+  bb <- b + 0.5
+  cc <- c + 0.5
+  dd <- d + 0.5
+
+  log_or <- log((aa * dd) / (bb * cc))
+  se <- sqrt(1 / aa + 1 / bb + 1 / cc + 1 / dd)
+  prop_test <- suppressWarnings(prop.test(x = c(a, c), n = c(a + b, c + d)))
+
+  data.frame(
+    exposed_group = label1,
+    control_group = label0,
+    exposed_decline = a,
+    exposed_total = a + b,
+    exposed_pct = safe_pct(a, a + b),
+    control_decline = c,
+    control_total = c + d,
+    control_pct = safe_pct(c, c + d),
+    odds_ratio = exp(log_or),
+    odds_low95 = exp(log_or - 1.96 * se),
+    odds_high95 = exp(log_or + 1.96 * se),
+    prop_test_p = prop_test$p.value,
+    stringsAsFactors = FALSE
+  )
+}
+
+extract_glm_table <- function(fit, model_name) {
+  co <- summary(fit)$coefficients
+  data.frame(
+    model = model_name,
+    term = rownames(co),
+    estimate = co[, 1],
+    std_error = co[, 2],
+    z_value = co[, 3],
+    p_value = co[, 4],
+    odds_ratio = exp(co[, 1]),
+    odds_low95 = exp(co[, 1] - 1.96 * co[, 2]),
+    odds_high95 = exp(co[, 1] + 1.96 * co[, 2]),
+    row.names = NULL
+  )
+}
+
+# ------------------------------------------------------------
+# 3. Input checks and TAC-SD decline indicator
+# ------------------------------------------------------------
+required_files <- c(
+  RAW_TAC_TREND, FILTERED_TAC_TREND, MONTHLY_VI,
+  AMT_RASTER, GSVPD_RASTER, PS_RASTER, IVP_RASTER,
+  HEAT_RASTER, DRY_RASTER, CLIMATE_ZONE_SHP
+)
+check_files(required_files)
+
+cat("[INFO] Reading TAC rasters...\n")
+r_raw_tac <- terra::rast(RAW_TAC_TREND)
+names(r_raw_tac) <- "raw_TAC_trend"
+
+r_filtered_tac <- align_to_template(FILTERED_TAC_TREND, r_raw_tac, method = "bilinear")
+names(r_filtered_tac) <- "filtered_TAC_trend"
+
+r_valid <- !is.na(r_raw_tac)
+names(r_valid) <- "valid_TAC_pixel"
+
+# Positive filtered TAC trend is interpreted as a TAC-SD-consistent local stability decline signal.
+r_decline <- terra::ifel(
+  r_valid,
+  terra::ifel(!is.na(r_filtered_tac) & r_filtered_tac > 0, 1, 0),
+  NA
+)
+names(r_decline) <- "decline_TAC_SD"
+
+r_enhanced <- terra::ifel(
+  r_valid,
+  terra::ifel(!is.na(r_filtered_tac) & r_filtered_tac < 0, 1, 0),
+  NA
+)
+names(r_enhanced) <- "enhanced_TAC_SD"
+
+terra::writeRaster(r_decline, file.path(OUTPUT_DIR, "decline_TAC_SD_binary.tif"), overwrite = TRUE)
+terra::writeRaster(r_enhanced, file.path(OUTPUT_DIR, "enhanced_TAC_SD_binary.tif"), overwrite = TRUE)
+
+# Overall TAC-SD summary.
+overall_stats <- data.frame(
+  metric = c("valid_TAC_pixels", "TAC_SD_decline_pixels", "TAC_SD_enhanced_pixels"),
+  count = c(
+    as.numeric(terra::global(!is.na(r_decline), "sum", na.rm = TRUE)[1, 1]),
+    as.numeric(terra::global(r_decline == 1, "sum", na.rm = TRUE)[1, 1]),
+    as.numeric(terra::global(r_enhanced == 1, "sum", na.rm = TRUE)[1, 1])
+  )
+)
+overall_stats$percent_of_valid <- safe_pct(overall_stats$count, overall_stats$count[1])
+readr::write_csv(overall_stats, file.path(OUTPUT_DIR, "01_overall_TAC_SD_stats.csv"))
+print(overall_stats)
+
+# ------------------------------------------------------------
+# 4. Vegetation greening metrics
+# ------------------------------------------------------------
+cat("[INFO] Computing mean vegetation index and greening trend...\n")
+
+r_vi_monthly <- terra::rast(MONTHLY_VI)
+r_vi_monthly <- align_to_template(r_vi_monthly, r_raw_tac, method = "bilinear")
+
+n_time <- terra::nlyr(r_vi_monthly)
+dates <- seq(START_DATE, by = "month", length.out = n_time)
+years <- as.integer(format(dates, "%Y"))
+
+# Use all available years in the stack. The public version assumes the stack is already preprocessed.
+r_vi_annual <- terra::tapp(r_vi_monthly, index = years, fun = mean, na.rm = TRUE)
+names(r_vi_annual) <- paste0("VI_", sort(unique(years)))
+
+r_mean_vi <- terra::mean(r_vi_annual, na.rm = TRUE)
+r_mean_vi <- terra::mask(r_mean_vi, r_valid, maskvalues = 0)
+names(r_mean_vi) <- "mean_VI"
+terra::writeRaster(r_mean_vi, file.path(OUTPUT_DIR, "mean_VI_valid_TAC_mask.tif"), overwrite = TRUE)
+
+trend_time <- sort(unique(years)) - mean(sort(unique(years)))
+trend_fun <- make_trend_fun(trend_time, min_valid_fraction = MIN_VALID_FRACTION)
+r_vi_trend <- terra::app(r_vi_annual, trend_fun, cores = N_THREADS)
+names(r_vi_trend) <- c("VI_slope", "VI_p")
+
+r_vi_slope <- terra::mask(r_vi_trend[["VI_slope"]], r_valid, maskvalues = 0)
+r_vi_p <- terra::mask(r_vi_trend[["VI_p"]], r_valid, maskvalues = 0)
+terra::writeRaster(r_vi_slope, file.path(OUTPUT_DIR, "VI_slope_valid_TAC_mask.tif"), overwrite = TRUE)
+terra::writeRaster(r_vi_p, file.path(OUTPUT_DIR, "VI_p_valid_TAC_mask.tif"), overwrite = TRUE)
+
+# Greening group: significant greening, significant browning, or no significant change.
+r_group <- terra::ifel(
+  !r_valid | is.na(r_vi_slope) | is.na(r_vi_p),
+  NA,
+  terra::ifel(
+    r_vi_p < 0.05 & r_vi_slope > 0,
+    1,
+    terra::ifel(r_vi_p < 0.05 & r_vi_slope < 0, -1, 0)
+  )
+)
+names(r_group) <- "greening_group"
+terra::writeRaster(r_group, file.path(OUTPUT_DIR, "greening_group_valid_TAC_mask.tif"), overwrite = TRUE)
+
+# ------------------------------------------------------------
+# 5. Decline prevalence by greening group
+# ------------------------------------------------------------
+cat("[INFO] Summarizing TAC-SD decline prevalence by greening group...\n")
+
+ct <- terra::crosstab(c(r_group, r_decline), long = TRUE, useNA = FALSE)
+ct <- as.data.frame(ct)
+names(ct) <- c("group", "decline", "count")
+
+all_combos <- expand.grid(group = c(-1, 0, 1), decline = c(0, 1))
+ct <- dplyr::left_join(all_combos, ct, by = c("group", "decline"))
+ct$count[is.na(ct$count)] <- 0
+
+group_summary <- ct %>%
+  dplyr::mutate(
+    group_label = dplyr::case_when(
+      group == 1  ~ "Significant greening",
+      group == 0  ~ "No significant change",
+      group == -1 ~ "Significant browning"
+    )
+  ) %>%
+  dplyr::group_by(group, group_label) %>%
+  dplyr::summarise(
+    total_pixels = sum(count),
+    decline_pixels = sum(count[decline == 1]),
+    non_decline_pixels = sum(count[decline == 0]),
+    decline_pct = safe_pct(decline_pixels, total_pixels),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(desc(group))
+
+readr::write_csv(group_summary, file.path(OUTPUT_DIR, "02_decline_rate_by_greening_group.csv"))
+print(group_summary)
+
+get_counts <- function(g) {
+  row <- group_summary %>% dplyr::filter(group == g)
+  list(
+    decline = row$decline_pixels,
+    non_decline = row$non_decline_pixels,
+    total = row$total_pixels
+  )
+}
+
+green <- get_counts(1)
+no_change <- get_counts(0)
+brown <- get_counts(-1)
+
+proportion_tests <- dplyr::bind_rows(
+  odds_ratio_table(
+    green$decline, green$non_decline,
+    no_change$decline, no_change$non_decline,
+    "Significant greening", "No significant change"
+  ),
+  odds_ratio_table(
+    green$decline, green$non_decline,
+    brown$decline, brown$non_decline,
+    "Significant greening", "Significant browning"
+  )
+)
+readr::write_csv(proportion_tests, file.path(OUTPUT_DIR, "03_greening_group_proportion_tests.csv"))
+
+# ------------------------------------------------------------
+# 6. Build model table
+# ------------------------------------------------------------
+cat("[INFO] Building model table...\n")
+
+r_amt <- align_to_template(AMT_RASTER, r_raw_tac, method = "bilinear")
+names(r_amt) <- "AMT"
+r_gsvpd <- align_to_template(GSVPD_RASTER, r_raw_tac, method = "bilinear")
+names(r_gsvpd) <- "GSVPD"
+r_ps <- align_to_template(PS_RASTER, r_raw_tac, method = "bilinear")
+names(r_ps) <- "PS"
+r_ivp <- align_to_template(IVP_RASTER, r_raw_tac, method = "bilinear")
+names(r_ivp) <- "IVP"
+r_heat <- align_to_template(HEAT_RASTER, r_raw_tac, method = "bilinear")
+names(r_heat) <- "Heat_exposure"
+r_dry <- align_to_template(DRY_RASTER, r_raw_tac, method = "bilinear")
+names(r_dry) <- "Drought_exposure"
+
+# Rasterize climate zones to the TAC grid.
+zones <- sf::st_read(CLIMATE_ZONE_SHP, quiet = TRUE)
+zones <- sf::st_transform(zones, terra::crs(r_raw_tac))
+zones$zone_id <- as.integer(as.character(zones[[CLIMATE_ZONE_FIELD]]))
+r_zone <- terra::rasterize(terra::vect(zones), r_raw_tac, field = "zone_id")
+names(r_zone) <- "zone_id"
+
+predictor_stack <- c(
+  r_decline, r_group, r_mean_vi, r_vi_slope, r_vi_p,
+  r_zone, r_amt, r_gsvpd, r_ps, r_ivp, r_heat, r_dry
+)
+names(predictor_stack) <- c(
+  "decline", "greening_group", "mean_VI", "VI_slope", "VI_p",
+  "zone_id", "AMT", "GSVPD", "PS", "IVP", "Heat_exposure", "Drought_exposure"
+)
+
+sample_size <- min(MAX_MODEL_SAMPLE, as.numeric(terra::global(!is.na(r_decline), "sum", na.rm = TRUE)[1, 1]))
+
+df_model <- terra::spatSample(
+  predictor_stack,
+  size = sample_size,
+  method = "random",
+  na.rm = TRUE,
+  as.df = TRUE,
+  xy = TRUE
+)
+
+df_model <- df_model %>%
+  dplyr::mutate(
+    decline = as.integer(decline),
+    greening_group = as.integer(greening_group),
+    trend_group = dplyr::case_when(
+      greening_group == 1  ~ "Significant greening",
+      greening_group == 0  ~ "No significant change",
+      greening_group == -1 ~ "Significant browning",
+      TRUE ~ NA_character_
+    ),
+    trend_group = factor(
+      trend_group,
+      levels = c("No significant change", "Significant greening", "Significant browning")
+    ),
+    zone_name = factor(
+      CLIMATE_ZONE_LABELS[as.integer(zone_id)],
+      levels = CLIMATE_ZONE_LABELS
+    ),
+    mean_VI_z = scale_vec(mean_VI),
+    VI_slope_z = scale_vec(VI_slope),
+    AMT_z = scale_vec(AMT),
+    GSVPD_z = scale_vec(GSVPD),
+    PS_z = scale_vec(PS),
+    IVP_z = scale_vec(IVP),
+    Heat_exposure_z = scale_vec(Heat_exposure),
+    Drought_exposure_z = scale_vec(Drought_exposure)
+  ) %>%
+  dplyr::filter(
+    !is.na(decline), !is.na(trend_group), !is.na(zone_name),
+    dplyr::if_all(c(mean_VI_z, VI_slope_z, AMT_z, GSVPD_z, PS_z, IVP_z,
+                    Heat_exposure_z, Drought_exposure_z, x, y), is.finite)
+  )
+
+readr::write_csv(df_model, file.path(OUTPUT_DIR, "04_model_table_sample.csv"))
+cat("[INFO] Model sample size:", nrow(df_model), "\n")
+cat("[INFO] Decline prevalence:", round(mean(df_model$decline) * 100, 2), "%\n")
+
+# ------------------------------------------------------------
+# 7. Logistic models
+# ------------------------------------------------------------
+cat("[INFO] Fitting logistic models...\n")
+
+fit_group <- glm(
+  decline ~ trend_group + AMT_z + GSVPD_z + PS_z + IVP_z +
+    Heat_exposure_z + Drought_exposure_z + zone_name,
+  family = binomial(link = "logit"),
+  data = df_model
+)
+
+fit_continuous <- glm(
+  decline ~ VI_slope_z + mean_VI_z + AMT_z + GSVPD_z + PS_z + IVP_z +
+    Heat_exposure_z + Drought_exposure_z + zone_name,
+  family = binomial(link = "logit"),
+  data = df_model
+)
+
+glm_table <- dplyr::bind_rows(
+  extract_glm_table(fit_group, "Group model"),
+  extract_glm_table(fit_continuous, "Continuous greenness-greening model")
+)
+readr::write_csv(glm_table, file.path(OUTPUT_DIR, "05_logistic_model_coefficients.csv"))
+
+# ------------------------------------------------------------
+# 8. GAM for nonlinear adjusted relationships
+# ------------------------------------------------------------
+cat("[INFO] Fitting GAM for nonlinear adjusted relationships...\n")
+
+fit_gam <- mgcv::bam(
+  decline ~
+    s(mean_VI_z, k = 8) +
+    s(VI_slope_z, k = 8) +
+    s(AMT_z, k = 6) +
+    s(GSVPD_z, k = 6) +
+    s(PS_z, k = 6) +
+    s(IVP_z, k = 6) +
+    s(Heat_exposure_z, k = 6) +
+    s(Drought_exposure_z, k = 6) +
+    zone_name +
+    s(x, y, k = 80),
+  family = binomial(link = "logit"),
+  data = df_model,
+  method = "fREML",
+  discrete = TRUE,
+  nthreads = N_THREADS
+)
+
+saveRDS(fit_gam, file.path(OUTPUT_DIR, "fit_GAM_decline_probability.rds"))
+capture.output(summary(fit_gam), file = file.path(OUTPUT_DIR, "06_GAM_summary.txt"))
+
+# ------------------------------------------------------------
+# 9. Prediction curves
+# ------------------------------------------------------------
+make_prediction_base <- function(n) {
+  common_zone <- names(sort(table(df_model$zone_name), decreasing = TRUE))[1]
+  data.frame(
+    mean_VI_z = rep(median(df_model$mean_VI_z, na.rm = TRUE), n),
+    VI_slope_z = rep(median(df_model$VI_slope_z, na.rm = TRUE), n),
+    AMT_z = rep(median(df_model$AMT_z, na.rm = TRUE), n),
+    GSVPD_z = rep(median(df_model$GSVPD_z, na.rm = TRUE), n),
+    PS_z = rep(median(df_model$PS_z, na.rm = TRUE), n),
+    IVP_z = rep(median(df_model$IVP_z, na.rm = TRUE), n),
+    Heat_exposure_z = rep(median(df_model$Heat_exposure_z, na.rm = TRUE), n),
+    Drought_exposure_z = rep(median(df_model$Drought_exposure_z, na.rm = TRUE), n),
+    x = rep(median(df_model$x, na.rm = TRUE), n),
+    y = rep(median(df_model$y, na.rm = TRUE), n),
+    zone_name = factor(rep(common_zone, n), levels = levels(df_model$zone_name))
+  )
+}
+
+predict_curve <- function(x_var, x_label) {
+  x_seq <- seq(
+    quantile(df_model[[x_var]], 0.02, na.rm = TRUE),
+    quantile(df_model[[x_var]], 0.98, na.rm = TRUE),
+    length.out = 200
+  )
+  nd <- make_prediction_base(length(x_seq))
+  nd[[x_var]] <- x_seq
+
+  pr <- predict(fit_gam, newdata = nd, type = "link", se.fit = TRUE, exclude = "s(x,y)")
+  out <- nd
+  out$x_value <- x_seq
+  out$x_variable <- x_var
+  out$x_label <- x_label
+  out$fit <- plogis(pr$fit)
+  out$lwr <- plogis(pr$fit - 1.96 * pr$se.fit)
+  out$upr <- plogis(pr$fit + 1.96 * pr$se.fit)
+  out
+}
+
+curve_df <- dplyr::bind_rows(
+  predict_curve("mean_VI_z", "Mean greenness"),
+  predict_curve("VI_slope_z", "Greening rate")
+)
+readr::write_csv(curve_df, file.path(OUTPUT_DIR, "07_adjusted_prediction_curves.csv"))
+
+# ------------------------------------------------------------
+# 10. Basic figures
+# ------------------------------------------------------------
+cat("[INFO] Saving basic diagnostic figures...\n")
+
+p_group <- group_summary %>%
+  dplyr::mutate(group_label = factor(
+    group_label,
+    levels = c("Significant greening", "No significant change", "Significant browning")
+  )) %>%
+  ggplot2::ggplot(ggplot2::aes(x = group_label, y = decline_pct, fill = group_label)) +
+  ggplot2::geom_col(width = 0.7, color = "black") +
+  ggplot2::labs(x = NULL, y = "TAC-SD decline signal (%)") +
+  ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(
+    legend.position = "none",
+    axis.text.x = ggplot2::element_text(angle = 20, hjust = 1),
+    panel.grid.minor = ggplot2::element_blank()
+  )
+
+ggplot2::ggsave(
+  file.path(OUTPUT_DIR, "Fig_decline_rate_by_greening_group.png"),
+  p_group, width = 6.5, height = 4.5, dpi = 300, bg = "white"
+)
+
+p_curves <- curve_df %>%
+  ggplot2::ggplot(ggplot2::aes(x = x_value, y = fit)) +
+  ggplot2::geom_ribbon(ggplot2::aes(ymin = lwr, ymax = upr), alpha = 0.18) +
+  ggplot2::geom_line(linewidth = 0.9) +
+  ggplot2::facet_wrap(~ x_label, scales = "free_x") +
+  ggplot2::labs(x = "Standardized predictor", y = "Adjusted decline probability") +
+  ggplot2::theme_bw(base_size = 12) +
+  ggplot2::theme(panel.grid.minor = ggplot2::element_blank())
+
+ggplot2::ggsave(
+  file.path(OUTPUT_DIR, "Fig_adjusted_probability_curves.png"),
+  p_curves, width = 7.2, height = 4.5, dpi = 300, bg = "white"
+)
+
+cat("\n============================================================\n")
+cat("[DONE] Public greening and TAC-SD analysis workflow finished.\n")
+cat("Outputs saved to:", OUTPUT_DIR, "\n")
+cat("============================================================\n")
