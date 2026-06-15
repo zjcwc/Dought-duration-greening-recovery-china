@@ -1,0 +1,595 @@
+# ============================================================
+# Calculate TAC (lag-1 temporal autocorrelation) from monthly vegetation index data
+#
+# Public GitHub version
+#
+# Workflow:
+#   1. Read a monthly vegetation-index raster stack.
+#   2. Keep pixels with sufficient valid observations; no gap filling is applied.
+#   3. Remove the low-frequency trend using a centered moving average.
+#   4. Remove seasonality using a third-order harmonic regression.
+#   5. Use the residual series to calculate rolling lag-1 TAC.
+#   6. Export residuals, rolling TAC stacks, date-lookup tables, and TAC trend maps.
+#
+# Notes:
+#   - No interpolation or gap filling is performed.
+#   - Increasing lag-1 TAC can indicate slower local recovery, when supported by
+#     appropriate consistency checks and ecological interpretation.
+#   - Large input rasters should not be stored directly in GitHub.
+# ============================================================
+
+# ============================================================
+# 0. User settings
+# ============================================================
+
+# Monthly vegetation-index stack. Each layer should represent one month.
+# Example: monthly kNDVI from 2000-02 to 2020-12.
+INPUT_VI <- "data/monthly_kNDVI_200002_202012.tif"
+
+# Output folder.
+OUTPUT_DIR <- "outputs/tac_calculation"
+
+# Output tag used in filenames.
+TAG <- "kNDVI_2000_2020"
+
+# First month represented by the first raster layer.
+START_DATE <- as.Date("2000-02-01")
+
+# Maximum fraction of missing observations allowed for a pixel.
+# Missing observations are retained as NA; they are not interpolated.
+MAX_NA_FRAC <- 0.20
+
+# Minimum number of valid observations required for harmonic fitting.
+MIN_VALID_MONTHS_FOR_RESIDUAL <- 24
+
+# Moving-average window used to remove low-frequency trends.
+# 60 months = 5 years.
+TREND_WINDOW_MONTHS <- 60
+
+# Rolling TAC windows in months.
+TAC_WINDOWS <- c(36, 60, 84)
+
+# Minimum fraction of valid lagged pairs required within each TAC window.
+MIN_PAIR_FRAC_TAC <- 0.50
+
+# Parallel setting.
+N_CORES_TARGET <- 16
+
+# Optional output of intermediate CSV files.
+WRITE_INTERMEDIATE_CSV <- TRUE
+
+# ============================================================
+# 1. Packages
+# ============================================================
+
+REQUIRED_PACKAGES <- c(
+  "raster",
+  "zoo",
+  "foreach",
+  "doParallel",
+  "parallel",
+  "stats"
+)
+
+load_required_packages <- function(pkgs) {
+  missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing_pkgs) > 0) {
+    stop(
+      "Please install the following R packages before running this script: ",
+      paste(missing_pkgs, collapse = ", ")
+    )
+  }
+  invisible(lapply(pkgs, library, character.only = TRUE))
+}
+
+# ============================================================
+# 2. Helper functions
+# ============================================================
+
+make_monthly_dates <- function(start_date, n_layers) {
+  seq.Date(from = start_date, by = "month", length.out = n_layers)
+}
+
+format_band_dates <- function(dates) {
+  sprintf(
+    "%04d_%02d",
+    as.integer(format(dates, "%Y")),
+    as.integer(format(dates, "%m"))
+  )
+}
+
+center_dates_for_window <- function(dates, window) {
+  n_time <- length(dates)
+  dates[seq(from = ceiling(window / 2), to = n_time - floor(window / 2), by = 1)]
+}
+
+centered_moving_average <- function(v, window) {
+  zoo::rollapply(
+    v,
+    width = window,
+    FUN = function(x) {
+      if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+    },
+    partial = TRUE,
+    align = "center"
+  )
+}
+
+fit_harmonic_residual <- function(v, trend_window, harmonic_df, min_valid_months) {
+  n_time <- length(v)
+
+  if (sum(is.finite(v)) < min_valid_months) {
+    return(list(
+      seasonal = rep(NA_real_, n_time),
+      trend = rep(NA_real_, n_time),
+      residual = rep(NA_real_, n_time)
+    ))
+  }
+
+  trend <- centered_moving_average(v, trend_window)
+  detrended <- v - trend
+
+  fit_df <- cbind(y = detrended, harmonic_df)
+
+  fit <- tryCatch(
+    stats::lm(
+      y ~ s1 + c1 + s2 + c2 + s3 + c3,
+      data = fit_df,
+      na.action = stats::na.exclude
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) {
+    return(list(
+      seasonal = rep(NA_real_, n_time),
+      trend = trend,
+      residual = rep(NA_real_, n_time)
+    ))
+  }
+
+  seasonal <- tryCatch(
+    as.numeric(stats::predict(fit, newdata = harmonic_df)),
+    error = function(e) rep(NA_real_, n_time)
+  )
+
+  residual <- detrended - seasonal
+  residual[!is.finite(v)] <- NA_real_
+
+  list(
+    seasonal = seasonal,
+    trend = trend,
+    residual = residual
+  )
+}
+
+lag1_correlation <- function(z, min_pair_frac = 0.50) {
+  if (length(z) < 3) return(NA_real_)
+
+  x <- z[-length(z)]
+  y <- z[-1]
+
+  ok <- is.finite(x) & is.finite(y)
+  min_pairs <- max(3, ceiling((length(z) - 1) * min_pair_frac))
+
+  if (sum(ok) < min_pairs) return(NA_real_)
+  if (stats::sd(x[ok]) == 0 || stats::sd(y[ok]) == 0) return(NA_real_)
+
+  as.numeric(stats::cor(x[ok], y[ok]))
+}
+
+rolling_lag1_tac <- function(v, window, min_pair_frac = 0.50) {
+  zoo::rollapply(
+    v,
+    width = window,
+    FUN = function(z) lag1_correlation(z, min_pair_frac = min_pair_frac),
+    by.column = FALSE,
+    align = "center"
+  )
+}
+
+calc_linear_slope <- function(x, t_vec, min_valid = 5) {
+  ok <- is.finite(x) & is.finite(t_vec)
+  if (sum(ok) < min_valid) return(NA_real_)
+  if (length(unique(x[ok])) < 2) return(NA_real_)
+
+  fit <- tryCatch(
+    stats::lm(x[ok] ~ t_vec[ok]),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) return(NA_real_)
+  as.numeric(stats::coef(fit)[2])
+}
+
+write_raster_stack_from_matrix <- function(
+    mat,
+    valid_cell_index,
+    template_raster,
+    layer_dates,
+    filename,
+    layer_prefix,
+    datatype = "FLT4S"
+) {
+  n_layers <- ncol(mat)
+
+  out_stack <- raster::brick(template_raster[[1]], nl = n_layers)
+  raster::names(out_stack) <- paste0(layer_prefix, "_", format_band_dates(layer_dates))
+
+  full_mat <- matrix(
+    NA_real_,
+    nrow = raster::ncell(template_raster),
+    ncol = n_layers
+  )
+
+  full_mat[valid_cell_index, ] <- mat
+  raster::values(out_stack) <- full_mat
+
+  raster::writeRaster(
+    out_stack,
+    filename = filename,
+    overwrite = TRUE,
+    options = c("COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES"),
+    datatype = datatype
+  )
+
+  invisible(out_stack)
+}
+
+write_tac_stack_and_slope <- function(
+    tac_matrix,
+    valid_cell_index,
+    template_raster,
+    dates_win,
+    window_label,
+    output_dir,
+    tag
+) {
+  tac_stack_file <- file.path(
+    output_dir,
+    paste0("tac_", tag, "_lag1_", window_label, ".tif")
+  )
+
+  tac_slope_file <- file.path(
+    output_dir,
+    paste0("tac_", tag, "_lag1_", window_label, "_slope.tif")
+  )
+
+  tac_stack <- write_raster_stack_from_matrix(
+    mat = tac_matrix,
+    valid_cell_index = valid_cell_index,
+    template_raster = template_raster,
+    layer_dates = dates_win,
+    filename = tac_stack_file,
+    layer_prefix = paste0("TAC_", window_label)
+  )
+
+  t_vec <- seq_len(raster::nlayers(tac_stack))
+  slope_fun <- function(x) calc_linear_slope(x, t_vec = t_vec)
+
+  tac_slope <- raster::calc(
+    tac_stack,
+    fun = slope_fun,
+    filename = tac_slope_file,
+    overwrite = TRUE,
+    options = c("COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES"),
+    datatype = "FLT4S"
+  )
+
+  invisible(list(
+    tac_stack = tac_stack,
+    tac_slope = tac_slope,
+    tac_stack_file = tac_stack_file,
+    tac_slope_file = tac_slope_file
+  ))
+}
+
+# ============================================================
+# 3. Main workflow
+# ============================================================
+
+main <- function() {
+  load_required_packages(REQUIRED_PACKAGES)
+
+  raster::rasterOptions(
+    tmpdir = file.path(tempdir(), "raster_tmp"),
+    progress = "text"
+  )
+
+  dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+  n_cores <- min(N_CORES_TARGET, max(1, parallel::detectCores(logical = TRUE)))
+  cat("[INFO] Using cores:", n_cores, "\n")
+
+  Sys.setenv(
+    OMP_NUM_THREADS = "1",
+    OPENBLAS_NUM_THREADS = "1",
+    MKL_NUM_THREADS = "1",
+    BLIS_NUM_THREADS = "1",
+    NUMEXPR_NUM_THREADS = "1"
+  )
+
+  if (!file.exists(INPUT_VI)) {
+    stop("Input raster does not exist: ", INPUT_VI)
+  }
+
+  # ------------------------------------------------------------
+  # 3.1 Read monthly vegetation-index stack
+  # ------------------------------------------------------------
+
+  cat("[INFO] Reading monthly vegetation-index raster stack...\n")
+
+  vi_stack <- raster::brick(INPUT_VI)
+  n_time <- raster::nlayers(vi_stack)
+
+  if (n_time < max(TAC_WINDOWS)) {
+    stop("The number of layers is smaller than the largest TAC window.")
+  }
+
+  dates <- make_monthly_dates(START_DATE, n_time)
+
+  cat(
+    "[INFO] Layers:", n_time,
+    "| Period:", as.character(dates[1]), "to", as.character(dates[n_time]), "\n"
+  )
+
+  # ------------------------------------------------------------
+  # 3.2 Extract valid pixels
+  # ------------------------------------------------------------
+
+  cat("[INFO] Extracting raster values...\n")
+
+  vi_df <- as.data.frame(vi_stack, xy = TRUE)
+  xy_df <- vi_df[, 1:2, drop = FALSE]
+  vi_values <- vi_df[, 3:(2 + n_time), drop = FALSE]
+
+  max_na_count <- floor(n_time * MAX_NA_FRAC)
+  valid_rows <- which(rowSums(is.na(vi_values)) <= max_na_count)
+
+  cat("[INFO] Valid pixels:", length(valid_rows), "of", nrow(vi_values), "\n")
+
+  valid_xy <- xy_df[valid_rows, , drop = FALSE]
+  valid_values <- vi_values[valid_rows, , drop = FALSE]
+  valid_cell_index <- valid_rows
+
+  if (WRITE_INTERMEDIATE_CSV) {
+    write.csv(
+      valid_cell_index,
+      file.path(OUTPUT_DIR, paste0("tac_", TAG, "_valid_cell_index.csv")),
+      row.names = FALSE
+    )
+
+    write.csv(
+      valid_xy,
+      file.path(OUTPUT_DIR, paste0("tac_", TAG, "_valid_pixel_xy.csv")),
+      row.names = FALSE
+    )
+  }
+
+  # Matrix with rows = time and columns = valid pixels.
+  vi_matrix_t <- t(as.matrix(valid_values))
+
+  # ------------------------------------------------------------
+  # 3.3 Remove trend and seasonality
+  # ------------------------------------------------------------
+
+  cat("[INFO] Removing trend and seasonality...\n")
+
+  t_seq <- seq_len(n_time)
+  w <- 2 * pi / 12
+
+  harmonic_df <- data.frame(
+    s1 = sin(w * t_seq),
+    c1 = cos(w * t_seq),
+    s2 = sin(2 * w * t_seq),
+    c2 = cos(2 * w * t_seq),
+    s3 = sin(3 * w * t_seq),
+    c3 = cos(3 * w * t_seq)
+  )
+
+  cl <- parallel::makeCluster(n_cores, type = "PSOCK")
+  doParallel::registerDoParallel(cl)
+
+  on.exit({
+    try(parallel::stopCluster(cl), silent = TRUE)
+    try(doParallel::registerDoSEQ(), silent = TRUE)
+  }, add = TRUE)
+
+  parallel::clusterExport(
+    cl,
+    varlist = c(
+      "TREND_WINDOW_MONTHS",
+      "MIN_VALID_MONTHS_FOR_RESIDUAL",
+      "harmonic_df",
+      "centered_moving_average",
+      "fit_harmonic_residual"
+    ),
+    envir = environment()
+  )
+
+  residual_results <- foreach::foreach(
+    i = seq_len(ncol(vi_matrix_t)),
+    .packages = c("zoo", "stats")
+  ) %dopar% {
+    v <- as.numeric(vi_matrix_t[, i])
+    fit_harmonic_residual(
+      v = v,
+      trend_window = TREND_WINDOW_MONTHS,
+      harmonic_df = harmonic_df,
+      min_valid_months = MIN_VALID_MONTHS_FOR_RESIDUAL
+    )
+  }
+
+  seasonal_matrix <- do.call(cbind, lapply(residual_results, `[[`, "seasonal"))
+  trend_matrix <- do.call(cbind, lapply(residual_results, `[[`, "trend"))
+  residual_matrix <- do.call(cbind, lapply(residual_results, `[[`, "residual"))
+
+  rm(residual_results)
+  gc()
+
+  if (WRITE_INTERMEDIATE_CSV) {
+    write.csv(
+      t(seasonal_matrix),
+      file.path(OUTPUT_DIR, paste0("tac_", TAG, "_seasonal_component.csv")),
+      row.names = FALSE
+    )
+
+    write.csv(
+      t(trend_matrix),
+      file.path(OUTPUT_DIR, paste0("tac_", TAG, "_moving_average_trend.csv")),
+      row.names = FALSE
+    )
+
+    write.csv(
+      t(residual_matrix),
+      file.path(OUTPUT_DIR, paste0("tac_", TAG, "_residual_series.csv")),
+      row.names = FALSE
+    )
+  }
+
+  # ------------------------------------------------------------
+  # 3.4 Export residual raster stack
+  # ------------------------------------------------------------
+
+  cat("[INFO] Writing residual raster stack...\n")
+
+  residual_raster_file <- file.path(
+    OUTPUT_DIR,
+    paste0("tac_", TAG, "_residual_stack.tif")
+  )
+
+  write_raster_stack_from_matrix(
+    mat = t(residual_matrix),
+    valid_cell_index = valid_cell_index,
+    template_raster = vi_stack,
+    layer_dates = dates,
+    filename = residual_raster_file,
+    layer_prefix = "Residual"
+  )
+
+  # ------------------------------------------------------------
+  # 3.5 Calculate rolling lag-1 TAC
+  # ------------------------------------------------------------
+
+  cat("[INFO] Calculating rolling lag-1 TAC...\n")
+
+  tac_results <- foreach::foreach(
+    i = seq_len(ncol(residual_matrix)),
+    .packages = c("zoo", "stats")
+  ) %dopar% {
+    v <- as.numeric(residual_matrix[, i])
+
+    out <- list()
+    for (win in TAC_WINDOWS) {
+      label <- paste0(win, "m")
+      out[[label]] <- rolling_lag1_tac(
+        v = v,
+        window = win,
+        min_pair_frac = MIN_PAIR_FRAC_TAC
+      )
+    }
+    out
+  }
+
+  tac_matrices <- list()
+  tac_dates <- list()
+
+  for (win in TAC_WINDOWS) {
+    label <- paste0(win, "m")
+    tac_matrices[[label]] <- do.call(cbind, lapply(tac_results, `[[`, label))
+    tac_dates[[label]] <- center_dates_for_window(dates, win)
+
+    if (WRITE_INTERMEDIATE_CSV) {
+      write.csv(
+        tac_matrices[[label]],
+        file.path(OUTPUT_DIR, paste0("tac_", TAG, "_lag1_", label, ".csv")),
+        row.names = FALSE
+      )
+    }
+
+    write.csv(
+      data.frame(
+        band = seq_along(tac_dates[[label]]),
+        center_date = tac_dates[[label]]
+      ),
+      file.path(OUTPUT_DIR, paste0("tac_", TAG, "_lag1_", label, "_band2date_center.csv")),
+      row.names = FALSE
+    )
+  }
+
+  rm(tac_results, seasonal_matrix, trend_matrix, residual_matrix)
+  gc()
+
+  try(parallel::stopCluster(cl), silent = TRUE)
+  try(doParallel::registerDoSEQ(), silent = TRUE)
+
+  # ------------------------------------------------------------
+  # 3.6 Export TAC stacks and TAC slope maps
+  # ------------------------------------------------------------
+
+  cat("[INFO] Writing TAC raster stacks and TAC slope maps...\n")
+
+  for (win in TAC_WINDOWS) {
+    label <- paste0(win, "m")
+
+    write_tac_stack_and_slope(
+      tac_matrix = t(tac_matrices[[label]]),
+      valid_cell_index = valid_cell_index,
+      template_raster = vi_stack,
+      dates_win = tac_dates[[label]],
+      window_label = label,
+      output_dir = OUTPUT_DIR,
+      tag = TAG
+    )
+  }
+
+  # ------------------------------------------------------------
+  # 3.7 Save run metadata
+  # ------------------------------------------------------------
+
+  run_info <- data.frame(
+    parameter = c(
+      "INPUT_VI",
+      "OUTPUT_DIR",
+      "TAG",
+      "START_DATE",
+      "n_layers",
+      "MAX_NA_FRAC",
+      "MIN_VALID_MONTHS_FOR_RESIDUAL",
+      "TREND_WINDOW_MONTHS",
+      "TAC_WINDOWS",
+      "MIN_PAIR_FRAC_TAC",
+      "N_CORES_USED"
+    ),
+    value = c(
+      INPUT_VI,
+      OUTPUT_DIR,
+      TAG,
+      as.character(START_DATE),
+      as.character(n_time),
+      as.character(MAX_NA_FRAC),
+      as.character(MIN_VALID_MONTHS_FOR_RESIDUAL),
+      as.character(TREND_WINDOW_MONTHS),
+      paste(TAC_WINDOWS, collapse = ", "),
+      as.character(MIN_PAIR_FRAC_TAC),
+      as.character(n_cores)
+    )
+  )
+
+  write.csv(
+    run_info,
+    file.path(OUTPUT_DIR, paste0("tac_", TAG, "_run_info.csv")),
+    row.names = FALSE
+  )
+
+  cat("\n============================================================\n")
+  cat("[DONE] TAC calculation finished.\n")
+  cat("Output folder:\n", OUTPUT_DIR, "\n\n")
+  cat("Main raster outputs:\n")
+  print(list.files(OUTPUT_DIR, pattern = paste0("^tac_", TAG, ".*\\.tif$"), full.names = TRUE))
+  cat("============================================================\n")
+
+  invisible(TRUE)
+}
+
+main()
